@@ -6,6 +6,10 @@
     <Nullable>enable</Nullable>
     <RootNamespace>IpcProtocol</RootNamespace>
     <AssemblyName>IpcProtocol</AssemblyName>
+    <!-- 开启 Native AOT / trimming 分析器：构建期就暴露 IL2026 / IL3050，而不是运行时才发现 -->
+    <IsAotCompatible>true</IsAotCompatible>
+    <!-- 可选：不依赖 ICU，AOT 产物更小；协议只用 UTF-8 编解码，不涉区域格式 -->
+    <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
 </Project>

@@ -69,7 +69,7 @@ public:
     // heartbeatIntervalMs <=0 关闭心跳；requiredToken 非空时未通过 HELLO 鉴权的请求被拒绝。
     RpcProtocol(std::shared_ptr<MessageStream> ms, int64_t heartbeatIntervalMs, int64_t heartbeatTimeoutMs,
                 std::string authToken, std::string requiredToken)
-        : state_(std::make_shared<State>()), ms_(std::move(ms)), authToken_(std::move(authToken)) {
+        : state_(std::make_shared<State>()), authToken_(std::move(authToken)), ms_(std::move(ms)) {
         state_->requiredToken = std::move(requiredToken);
         // v1.1.2：未显式传 token 时回退环境变量 IPC_TOKEN（Node 主进程注入）
         if (authToken_.empty()) {

@@ -5,8 +5,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>AuthClient</AssemblyName>
+    <!-- 同目录还有 SupervisorTest.cs（另一个顶层语句入口），必须显式指定编译单元 -->
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="Program.cs" />
     <ProjectReference Include="..\..\..\csharp\IpcProtocol\IpcProtocol.csproj" />
   </ItemGroup>
 </Project>

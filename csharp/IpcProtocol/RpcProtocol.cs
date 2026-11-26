@@ -9,8 +9,10 @@
 
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
 
 namespace IpcProtocol;
 
@@ -82,35 +84,6 @@ public sealed class RpcProtocol : IDisposable
     public string? HeartbeatDisabledReason { get; private set; }
     private readonly SemaphoreSlim _authLock = new(1, 1);
 
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        // 与 JSON.stringify 一致：不转义非 ASCII 之外的差异可接受，保持紧凑输出
-        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-        // JS 中 Buffer/TypedArray 经 JSON.stringify 输出为数字数组，而非 Base64
-        Converters = { new ByteArrayAsNumberArrayConverter() },
-    };
-
-    /// <summary>byte[] 与 JSON 数字数组互转，对齐 JS 的 JSON.stringify(Buffer) 行为。</summary>
-    private sealed class ByteArrayAsNumberArrayConverter : System.Text.Json.Serialization.JsonConverter<byte[]>
-    {
-        public override byte[] Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
-        {
-            if (reader.TokenType != JsonTokenType.StartArray)
-                throw new JsonException("Expected array of numbers for byte[]");
-            var list = new List<byte>();
-            while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                list.Add(reader.GetByte());
-            return list.ToArray();
-        }
-
-        public override void Write(Utf8JsonWriter writer, byte[] value, JsonSerializerOptions options)
-        {
-            writer.WriteStartArray();
-            foreach (var b in value) writer.WriteNumberValue(b);
-            writer.WriteEndArray();
-        }
-    }
-
     public RpcProtocol(MessageStream messageStream, TimeSpan? heartbeatInterval = null,
         TimeSpan? heartbeatTimeout = null, string? authToken = null, string? requiredToken = null,
         string[]? capabilities = null)
@@ -171,15 +144,15 @@ public sealed class RpcProtocol : IDisposable
         string? token = content is JsonElement jt && jt.ValueKind == JsonValueKind.Object
             && jt.TryGetProperty("token", out var t) && t.ValueKind == JsonValueKind.String
             ? t.GetString() : null;
-        object ack;
+        byte[] ack;
         bool fail = false;
         if (version != ProtocolVersion)
         {
-            ack = new { error = $"unsupported protocol version: {version}" }; fail = true;
+            ack = JsonPayload.Error($"unsupported protocol version: {version}"); fail = true;
         }
         else if (!string.IsNullOrEmpty(RequiredToken) && token != RequiredToken)
         {
-            ack = new { error = "unauthorized" }; fail = true;
+            ack = JsonPayload.Error("unauthorized"); fail = true;
         }
         else
         {
@@ -188,9 +161,9 @@ public sealed class RpcProtocol : IDisposable
             var peerCaps = PeerCapabilities;
             if (peerCaps != null && !peerCaps.Contains("ping"))
                 DisableHeartbeat($"peer {ReadString(content, "impl") ?? "unknown"} declares no 'ping' capability");
-            ack = new { version = ProtocolVersion, ok = true, caps = Capabilities, impl = ImplName };
+            ack = JsonPayload.HelloAck(true, ProtocolVersion, Capabilities, ImplName);
         }
-        try { await SendRawAsync(Types.HelloAck, ContentTypes.Json, id, ack).ConfigureAwait(false); }
+        try { await SendRawBytesAsync(Types.HelloAck, ContentTypes.Json, id, ack).ConfigureAwait(false); }
         catch { /* ignore */ }
         if (fail) Dispose();
     }
@@ -230,12 +203,10 @@ public sealed class RpcProtocol : IDisposable
         var id = Guid.NewGuid().ToString();
         var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pendingRequests[id] = tcs;
-        object payload = AuthToken is null
-            ? new { version = ProtocolVersion, caps = Capabilities, impl = ImplName }
-            : new { version = ProtocolVersion, token = AuthToken, caps = Capabilities, impl = ImplName };
         try
         {
-            await SendRawAsync(Types.Hello, ContentTypes.Json, id, payload).ConfigureAwait(false);
+            await SendRawBytesAsync(Types.Hello, ContentTypes.Json, id,
+                JsonPayload.Hello(ProtocolVersion, AuthToken, Capabilities, ImplName)).ConfigureAwait(false);
         }
         catch (Exception err)
         {
@@ -248,19 +219,15 @@ public sealed class RpcProtocol : IDisposable
     // ========== 序列化 ==========
 
     public static byte[] Serialize(byte type, byte contentType, string id, object? data)
+        => SerializeRaw(type, contentType, id, SerializePayload(contentType, data));
+
+    /// <summary>用已编码好的载荷组帧（协议内部报文走这条路，完全不经过序列化器）。</summary>
+    public static byte[] SerializeRaw(byte type, byte contentType, string id, byte[] payload)
     {
         var header = new byte[18];
         header[0] = type;
         header[1] = contentType;
         System.Convert.FromHexString(id.Replace("-", "")).CopyTo(header, 2);
-
-        byte[] payload = contentType switch
-        {
-            ContentTypes.Text => Encoding.UTF8.GetBytes((string)data!),
-            ContentTypes.Json => JsonSerializer.SerializeToUtf8Bytes(data, JsonOptions),
-            ContentTypes.Binary => (byte[])data!,
-            _ => throw new NotSupportedException($"Unsupported content type: {contentType}"),
-        };
         var result = new byte[18 + payload.Length];
         header.CopyTo(result, 0);
         payload.CopyTo(result, 18);
@@ -288,7 +255,7 @@ public sealed class RpcProtocol : IDisposable
     public static byte[] EncodeBinaryRequest(string method, object?[] parameters, byte[] binaryData)
     {
         var methodBuf = Encoding.UTF8.GetBytes(method);
-        var paramsBuf = JsonSerializer.SerializeToUtf8Bytes(parameters, JsonOptions);
+        var paramsBuf = JsonPayload.Serialize(parameters);
         var result = new byte[4 + methodBuf.Length + 4 + paramsBuf.Length + binaryData.Length];
         int offset = 0;
         BinaryPrimitives.WriteUInt32BigEndian(result.AsSpan(offset), (uint)methodBuf.Length); offset += 4;
@@ -366,7 +333,7 @@ public sealed class RpcProtocol : IDisposable
                 {
                     string hex = System.Convert.ToHexString(buffer, 2, 16).ToLowerInvariant();
                     string id = $"{hex[..8]}-{hex[8..12]}-{hex[12..16]}-{hex[16..20]}-{hex[20..]}";
-                    _ = SendResponseAsync(id, new { error = "Invalid request payload" });
+                    _ = SendResponseBytesAsync(id, JsonPayload.Error("Invalid request payload"));
                 }
                 catch { /* ignore */ }
             }
@@ -383,7 +350,7 @@ public sealed class RpcProtocol : IDisposable
     {
         // 未鉴权：回错误但不断链（允许随后 hello 重试）；连续 5 次才强制断开
         int hits = Interlocked.Increment(ref _unauthorizedHits);
-        try { await SendResponseAsync(id, new { error = "Unauthorized" }).ConfigureAwait(false); }
+        try { await SendResponseBytesAsync(id, JsonPayload.Error("Unauthorized")).ConfigureAwait(false); }
         catch { /* ignore */ }
         if (hits >= 5) Dispose();
     }
@@ -423,13 +390,13 @@ public sealed class RpcProtocol : IDisposable
         }
         catch (Exception err)
         {
-            await SendResponseAsync(id, new { error = $"Invalid request payload: {err.Message}" }).ConfigureAwait(false);
+            await SendResponseBytesAsync(id, JsonPayload.Error($"Invalid request payload: {err.Message}")).ConfigureAwait(false);
             return;
         }
 
         if (!_handlers.TryGetValue(method, out var handler))
         {
-            await SendResponseAsync(id, new { error = $"Method not found: {method}" }).ConfigureAwait(false);
+            await SendResponseBytesAsync(id, JsonPayload.Error($"Method not found: {method}")).ConfigureAwait(false);
             return;
         }
 
@@ -443,7 +410,7 @@ public sealed class RpcProtocol : IDisposable
         }
         catch (Exception err)
         {
-            await SendResponseAsync(id, new { error = err.Message }).ConfigureAwait(false);
+            await SendResponseBytesAsync(id, JsonPayload.Error(err.Message)).ConfigureAwait(false);
         }
     }
 
@@ -511,9 +478,23 @@ public sealed class RpcProtocol : IDisposable
 
     public Task SendRawAsync(byte type, byte contentType, string id, object? data)
     {
-        var stream = _messageStream ?? throw new InvalidOperationException("messageStream is not initialized");
-        return stream.SendAsync(Serialize(type, contentType, id, data));
+        return SendRawBytesAsync(type, contentType, id, SerializePayload(contentType, data));
     }
+
+    /// <summary>直接发送已编码载荷（协议内部报文与 AOT 场景用这条路径）。</summary>
+    public Task SendRawBytesAsync(byte type, byte contentType, string id, byte[] payload)
+    {
+        var stream = _messageStream ?? throw new InvalidOperationException("messageStream is not initialized");
+        return stream.SendAsync(SerializeRaw(type, contentType, id, payload));
+    }
+
+    private static byte[] SerializePayload(byte contentType, object? data) => contentType switch
+    {
+        ContentTypes.Text => Encoding.UTF8.GetBytes((string)data!),
+        ContentTypes.Json => JsonPayload.Serialize(data),
+        ContentTypes.Binary => (byte[])data!,
+        _ => throw new NotSupportedException($"Unsupported content type: {contentType}"),
+    };
 
     /// <summary>等待响应；超时移除 pending 并抛 RpcException(Code="ETIMEDOUT")，对齐 JS 修复版。</summary>
     private async Task<object?> WaitPendingAsync(string id, TaskCompletionSource<object?> tcs, string method, TimeSpan? timeout)
@@ -554,12 +535,10 @@ public sealed class RpcProtocol : IDisposable
         var id = Guid.NewGuid().ToString();
         var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pendingRequests[id] = tcs;
-        var body = to is null
-            ? (object)new { method, @params = parameters }
-            : new { method, @params = parameters, to };
         try
         {
-            await SendRawAsync(Types.Request, ContentTypes.Json, id, body).ConfigureAwait(false);
+            await SendRawBytesAsync(Types.Request, ContentTypes.Json, id,
+                JsonPayload.Request(method, parameters, to)).ConfigureAwait(false);
         }
         catch (Exception err)
         {
@@ -569,11 +548,21 @@ public sealed class RpcProtocol : IDisposable
         return await WaitPendingAsync(id, tcs, method, timeout).ConfigureAwait(false);
     }
 
-    /// <summary>发送 JSON 请求并把 JSON 响应反序列化为 T。</summary>
+    /// <summary>发送 JSON 请求并把 JSON 响应反序列化为 T（反射版，Native AOT 下不可用）。</summary>
+    [RequiresUnreferencedCode("反射反序列化需要运行时元数据；Native AOT 请用带 JsonTypeInfo<T> 的重载。")]
+    [RequiresDynamicCode("反射反序列化在 Native AOT 下不可用；请用带 JsonTypeInfo<T> 的重载。")]
     public async Task<T?> SendRequestAsync<T>(string method, object? parameters = null, string? to = null, TimeSpan? timeout = null)
     {
         var result = await SendRequestAsync(method, parameters, to, timeout).ConfigureAwait(false);
         return Convert<T>(result);
+    }
+
+    /// <summary>发送 JSON 请求并按 JsonTypeInfo&lt;T&gt; 反序列化响应（Native AOT 安全）。</summary>
+    public async Task<T?> SendRequestAsync<T>(string method, object? parameters, JsonTypeInfo<T> responseType,
+        string? to = null, TimeSpan? timeout = null)
+    {
+        var result = await SendRequestAsync(method, parameters, to, timeout).ConfigureAwait(false);
+        return Convert(result, responseType);
     }
 
     /// <summary>发送二进制请求并等待响应（默认超时）。服务端 handler 收到 [data, ...args]。</summary>
@@ -603,6 +592,10 @@ public sealed class RpcProtocol : IDisposable
     public Task SendResponseAsync(string id, object? response, byte contentType = ContentTypes.Json)
         => SendRawAsync(Types.Response, contentType, id, response);
 
+    /// <summary>发送已编码的 JSON 响应（AOT 场景或自建载荷时使用）。</summary>
+    public Task SendResponseBytesAsync(string id, byte[] jsonPayload)
+        => SendRawBytesAsync(Types.Response, ContentTypes.Json, id, jsonPayload);
+
     // ========== 辅助方法 ==========
 
     public Task SendTextAsync(string text)
@@ -614,6 +607,11 @@ public sealed class RpcProtocol : IDisposable
     public Task SendJsonAsync(object? data)
         => SendRawAsync(Types.Event, ContentTypes.Json, Guid.NewGuid().ToString(), data);
 
+    /// <summary>发送 JSON 事件（JsonTypeInfo 版本，Native AOT 安全）。</summary>
+    public Task SendJsonAsync<T>(T data, JsonTypeInfo<T> typeInfo)
+        => SendRawBytesAsync(Types.Event, ContentTypes.Json, Guid.NewGuid().ToString(),
+            JsonSerializer.SerializeToUtf8Bytes(data, typeInfo));
+
     /// <summary>注册异步方法处理器。JSON 参数以 JsonElement 传入，可用 Convert&lt;T&gt; 转换。</summary>
     public void RegisterMethod(string name, Func<object?[], Task<object?>> handler)
         => _handlers[name] = handler;
@@ -622,12 +620,50 @@ public sealed class RpcProtocol : IDisposable
     public void RegisterMethod(string name, Func<object?[], object?> handler)
         => _handlers[name] = args => Task.FromResult(handler(args));
 
-    /// <summary>把 JSON 参数/结果（JsonElement）转换为强类型对象。</summary>
+    /// <summary>注册异步处理器，返回值按 JsonTypeInfo&lt;T&gt; 序列化（Native AOT 安全）。</summary>
+    public void RegisterMethod<T>(string name, Func<object?[], Task<T>> handler, JsonTypeInfo<T> resultType)
+        => _handlers[name] = async args =>
+            JsonSerializer.SerializeToElement(await handler(args).ConfigureAwait(false), resultType);
+
+    /// <summary>注册同步处理器，返回值按 JsonTypeInfo&lt;T&gt; 序列化（Native AOT 安全）。</summary>
+    public void RegisterMethod<T>(string name, Func<object?[], T> handler, JsonTypeInfo<T> resultType)
+        => _handlers[name] = args =>
+            Task.FromResult<object?>(JsonSerializer.SerializeToElement(handler(args), resultType));
+
+    /// <summary>把强类型值转成 JsonElement（调用 JsonTypeInfo，Native AOT 安全）。</summary>
+    public static JsonElement Json<T>(T value, JsonTypeInfo<T> typeInfo)
+        => JsonSerializer.SerializeToElement(value, typeInfo);
+
+    /// <summary>把若干 JsonElement 组装成位置参数数组（可直接作为 parameters 传入）。</summary>
+    public static JsonElement Args(params JsonElement[] args)
+    {
+        var bytes = JsonPayload.Build(w =>
+        {
+            w.WriteStartArray();
+            foreach (var arg in args) arg.WriteTo(w);
+            w.WriteEndArray();
+        });
+        using var doc = JsonDocument.Parse(bytes);
+        return doc.RootElement.Clone();
+    }
+
+    /// <summary>把 JSON 参数/结果（JsonElement）转换为强类型对象（反射版，Native AOT 下不可用）。</summary>
+    [RequiresUnreferencedCode("反射反序列化需要运行时元数据；Native AOT 请用 Convert<T>(value, JsonTypeInfo<T>)。")]
+    [RequiresDynamicCode("反射反序列化在 Native AOT 下不可用；请用 Convert<T>(value, JsonTypeInfo<T>)。")]
     public static T? Convert<T>(object? value)
     {
         if (value is T typed) return typed;
-        if (value is JsonElement element) return element.Deserialize<T>(JsonOptions);
         if (value is null) return default;
+        if (value is JsonElement element) return JsonSerializer.Deserialize<T>(element);
+        return (T)System.Convert.ChangeType(value, typeof(T))!;
+    }
+
+    /// <summary>把 JSON 参数/结果转换为强类型对象（JsonTypeInfo 版本，Native AOT 安全）。</summary>
+    public static T? Convert<T>(object? value, JsonTypeInfo<T> typeInfo)
+    {
+        if (value is T typed) return typed;
+        if (value is null) return default;
+        if (value is JsonElement element) return JsonSerializer.Deserialize(element, typeInfo);
         return (T)System.Convert.ChangeType(value, typeof(T))!;
     }
 
