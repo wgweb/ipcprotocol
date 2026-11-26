@@ -1,0 +1,10 @@
+[package]
+name = "ipcprotocol"
+version = "1.0.0"
+edition = "2021"
+description = "Cross-language IPC/RPC protocol compatible with MessageStream.js / RpcProtocol.js"
+
+[dependencies]
+
+[profile.release]
+opt-level = 2

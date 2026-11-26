@@ -1,0 +1,10 @@
+{
+  "name": "ipcprotocol",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "dependencies": {
+    "uuid": "^9.0.0"
+  }
+}
